@@ -22,6 +22,13 @@ function getGeminiClient(): GoogleGenAI {
 // GENERATE EMBEDDING
 // =====================================
 
+const REQUEST_TIMEOUT_MS = 15000;
+const PER_MODEL_TIMEOUT_MS = 5000;
+const FALLBACK_CHAT_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite"
+];
+
 export async function embedText(
     text: string,
     taskType: "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY"
@@ -33,7 +40,8 @@ export async function embedText(
         contents: text,
         config: {
             taskType,
-            outputDimensionality: 768
+            outputDimensionality: 768,
+            abortSignal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
         }
     });
 
@@ -69,15 +77,34 @@ export async function generateAnswer(
     context: string
 ): Promise<string> {
     const client = getGeminiClient();
+    const deadline = Date.now() + REQUEST_TIMEOUT_MS;
 
-    const response = await client.models.generateContent({
-        model: env.chatModel,
+    const modelsToTry = [
+        env.chatModel,
+        ...FALLBACK_CHAT_MODELS.filter((m) => m !== env.chatModel)
+    ];
 
-        config: {
-            systemInstruction: SYSTEM_PROMPT
-        },
+    let lastError: unknown;
 
-        contents: `
+    for (const model of modelsToTry) {
+        const remainingMs = deadline - Date.now();
+
+        if (remainingMs <= 500) {
+            throw new Error("AI response timed out");
+        }
+
+        const attemptTimeoutMs = Math.min(PER_MODEL_TIMEOUT_MS, remainingMs);
+
+        try {
+            const response = await client.models.generateContent({
+                model,
+
+                config: {
+                    systemInstruction: SYSTEM_PROMPT,
+                    abortSignal: AbortSignal.timeout(attemptTimeoutMs)
+                },
+
+                contents: `
       DOCUMENT CONTEXT:
 
       ${context}
@@ -86,7 +113,40 @@ export async function generateAnswer(
 
       ${question}
     `
-    });
+            });
 
-    return response.text || "No answer generated.";
+            return response.text || "No answer generated.";
+        } catch (error: unknown) {
+            lastError = error;
+            const message =
+                error instanceof Error ? error.message : String(error);
+
+            const isTimedOut =
+                error instanceof Error &&
+                (error.name === "TimeoutError" ||
+                    error.name === "AbortError");
+
+            // If total deadline is reached, stop immediately.
+            if (Date.now() >= deadline) {
+                throw new Error(
+                    `AI response timed out: ${message}`,
+                    { cause: error }
+                );
+            }
+
+            // Retry with fallback model if this model timed out or is overloaded (503).
+            const isOverloaded =
+                isTimedOut ||
+                message.includes("503") ||
+                message.includes("UNAVAILABLE") ||
+                message.toLowerCase().includes("high demand") ||
+                message.toLowerCase().includes("overloaded");
+
+            if (!isOverloaded) {
+                throw error;
+            }
+        }
+    }
+
+    throw lastError;
 }
