@@ -1,9 +1,9 @@
-
-
 import express from "express";
 import cors from "cors";
 
 import { pool } from "./db/pool.js";
+import { getSecurityFlags } from "./config/security.js";
+import { errorHandler } from "./middleware/error.middleware.js";
 
 import authRoutes from "./routes/auth.routes.js";
 import documentRoutes from "./routes/documents.routes.js";
@@ -14,10 +14,12 @@ const app = express();
 // Local development CORS configuration.
 app.use(cors());
 
-// INTENTIONALLY INSECURE:
-// Large JSON payloads are accepted for cost-abuse testing.
-// This app must remain local-only.
-app.use(express.json({ limit: "1gb" }));
+// Dynamic JSON payload limit based on security flags.
+app.use((req, res, next) => {
+    const flags = getSecurityFlags();
+    const limit = flags.uploadValidation ? "100kb" : "1gb";
+    express.json({ limit })(req, res, next);
+});
 
 // =====================================
 // HEALTH CHECK
@@ -26,11 +28,20 @@ app.use(express.json({ limit: "1gb" }));
 app.get("/api/health", async (_req, res) => {
     try {
         await pool.query("SELECT 1");
+        const flags = getSecurityFlags();
 
         res.json({
             status: "ok",
             database: "connected",
-            securityMode: process.env.SECURITY_MODE || "vulnerable"
+            securityMode: flags.mode,
+            controls: {
+                tenantIsolation: flags.tenantIsolation,
+                rbac: flags.rbac,
+                uploadValidation: flags.uploadValidation,
+                rateLimiting: flags.rateLimiting,
+                promptDefense: flags.promptDefense,
+                auditLogging: flags.auditLogging
+            }
         });
     } catch {
         res.status(503).json({
@@ -61,15 +72,9 @@ app.use((_req, res) => {
 });
 
 // =====================================
-// ERROR HANDLER
+// CENTRALIZED ERROR HANDLER
 // =====================================
 
-app.use((error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    console.error(error);
-
-    res.status(500).json({
-        message: "Internal server error"
-    });
-});
+app.use(errorHandler);
 
 export default app;

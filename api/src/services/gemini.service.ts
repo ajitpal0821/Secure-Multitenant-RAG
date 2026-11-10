@@ -1,6 +1,10 @@
-
 import { GoogleGenAI } from "@google/genai";
 import { env } from "../config/env.js";
+import { getSecurityFlags } from "../config/security.js";
+import {
+    HARDENED_SYSTEM_PROMPT,
+    sanitizeModelOutput
+} from "./prompt-defense.service.js";
 
 let ai: GoogleGenAI | null = null;
 
@@ -22,12 +26,17 @@ function getGeminiClient(): GoogleGenAI {
 // GENERATE EMBEDDING
 // =====================================
 
-const REQUEST_TIMEOUT_MS = 15000;
-const PER_MODEL_TIMEOUT_MS = 5000;
+const REQUEST_TIMEOUT_MS = 20000;
+const PER_MODEL_TIMEOUT_MS = 8000;
 const FALLBACK_CHAT_MODELS = [
+    "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
-    "gemini-3.5-flash-lite"
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash"
 ];
+
+const quotaExhaustedModels = new Set<string>();
 
 export async function embedText(
     text: string,
@@ -59,9 +68,7 @@ export async function embedText(
 // =====================================
 
 // INTENTIONALLY INSECURE v0 system prompt.
-// Prompt hardening will be implemented in Phase 6.
-
-const SYSTEM_PROMPT = `
+const VULNERABLE_SYSTEM_PROMPT = `
 You are an AI assistant for a company knowledge base.
 
 Answer questions using the provided document context.
@@ -77,12 +84,25 @@ export async function generateAnswer(
     context: string
 ): Promise<string> {
     const client = getGeminiClient();
+    const flags = getSecurityFlags();
     const deadline = Date.now() + REQUEST_TIMEOUT_MS;
 
-    const modelsToTry = [
+    const systemInstruction = flags.promptDefense
+        ? HARDENED_SYSTEM_PROMPT
+        : VULNERABLE_SYSTEM_PROMPT;
+
+    const allCandidates = [
         env.chatModel,
         ...FALLBACK_CHAT_MODELS.filter((m) => m !== env.chatModel)
     ];
+
+    const modelsToTry = allCandidates.filter(
+        (m) => !quotaExhaustedModels.has(m)
+    );
+
+    if (modelsToTry.length === 0) {
+        modelsToTry.push(...allCandidates);
+    }
 
     let lastError: unknown;
 
@@ -93,14 +113,17 @@ export async function generateAnswer(
             throw new Error("AI response timed out");
         }
 
-        const attemptTimeoutMs = Math.min(PER_MODEL_TIMEOUT_MS, remainingMs);
+        const attemptTimeoutMs = Math.min(
+            PER_MODEL_TIMEOUT_MS,
+            remainingMs
+        );
 
         try {
             const response = await client.models.generateContent({
                 model,
 
                 config: {
-                    systemInstruction: SYSTEM_PROMPT,
+                    systemInstruction,
                     abortSignal: AbortSignal.timeout(attemptTimeoutMs)
                 },
 
@@ -115,11 +138,22 @@ export async function generateAnswer(
     `
             });
 
-            return response.text || "No answer generated.";
+            const rawText = response.text || "No answer generated.";
+
+            return flags.promptDefense
+                ? sanitizeModelOutput(rawText)
+                : rawText;
         } catch (error: unknown) {
             lastError = error;
             const message =
                 error instanceof Error ? error.message : String(error);
+
+            if (
+                message.includes("429") ||
+                message.includes("RESOURCE_EXHAUSTED")
+            ) {
+                quotaExhaustedModels.add(model);
+            }
 
             const isTimedOut =
                 error instanceof Error &&
@@ -134,15 +168,18 @@ export async function generateAnswer(
                 );
             }
 
-            // Retry with fallback model if this model timed out or is overloaded (503).
-            const isOverloaded =
+            // Retry with fallback model if this model timed out, hit quota (429), or is overloaded (503).
+            const isRetryable =
                 isTimedOut ||
+                message.includes("429") ||
+                message.includes("RESOURCE_EXHAUSTED") ||
                 message.includes("503") ||
                 message.includes("UNAVAILABLE") ||
                 message.toLowerCase().includes("high demand") ||
-                message.toLowerCase().includes("overloaded");
+                message.toLowerCase().includes("overloaded") ||
+                message.toLowerCase().includes("quota");
 
-            if (!isOverloaded) {
+            if (!isRetryable) {
                 throw error;
             }
         }

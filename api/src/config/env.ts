@@ -38,6 +38,11 @@ export const env = {
         database: process.env.DB_NAME!
     },
 
+    redis: {
+        host: process.env.REDIS_HOST || "localhost",
+        port: Number(process.env.REDIS_PORT || 6379)
+    },
+
     geminiApiKey: process.env.GEMINI_API_KEY,
 
     embeddingModel:
